@@ -129,12 +129,12 @@ const char * custom_script_path = NULL;
 char *symbols_download_directory = NULL;
 char *profile_uuid = NULL;
 char *profile_path = NULL;
+int command_pid = -1;
 int _timeout = 0;
 int _detectDeadlockTimeout = 0;
 bool _json_output = false;
 NSMutableArray *_file_meta_info = nil;
 int port = 0;    // 0 means "dynamically assigned"
-ServiceConnRef dbgServiceConnection = NULL;
 pid_t parent = 0;
 // PID of child process running lldb
 pid_t child = 0;
@@ -142,9 +142,9 @@ pid_t child = 0;
 const int SIGLLDB = SIGUSR1;
 NSString* tmpUUID;
 struct am_device_notification *notify;
-CFRunLoopSourceRef lldb_socket_runloop;
-CFRunLoopSourceRef server_socket_runloop;
 CFRunLoopSourceRef fdvendor_runloop;
+
+CFMutableDictionaryRef debugserver_active_connections;
 
 uint32_t symbols_file_paths_command = 0x30303030;
 uint32_t symbols_download_file_command = 0x01000000;
@@ -1190,74 +1190,94 @@ void write_lldb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
     CFRelease(pmodule);
 }
 
-CFSocketRef server_socket;
-CFSocketRef lldb_socket;
-CFWriteStreamRef serverWriteStream = NULL;
-CFWriteStreamRef lldbWriteStream = NULL;
-
 int kill_ptree(pid_t root, int signum);
-void
-server_callback (CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info)
-{
+
+const CFStringRef kDbgConnectionPropertyServiceConnection = CFSTR("service_connection");
+const CFStringRef kDbgConnectionPropertyLLDBSocket = CFSTR("lldb_socket");
+const CFStringRef kDbgConnectionPropertyLLDBSocketRunLoop = CFSTR("lldb_socket_runloop");
+const CFStringRef kDbgConnectionPropertyServerSocket = CFSTR("server_socket");
+const CFStringRef kDbgConnectionPropertyServerSocketRunLoop = CFSTR("server_socket_runloop");
+
+CFSocketContext get_socket_context(CFNumberRef connection_id) {
+    CFSocketContext context = { 0, (void*)connection_id, NULL, NULL, NULL };
+    return context;
+}
+
+CFMutableDictionaryRef get_connection_properties(CFNumberRef connection_id) {
+    // This is no-op if the key already exists
+    CFDictionaryAddValue(debugserver_active_connections, connection_id, CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+
+    return (CFMutableDictionaryRef)CFDictionaryGetValue(debugserver_active_connections, connection_id);
+}
+
+void close_connection(CFNumberRef connection_id) {
+    CFMutableDictionaryRef connection_properties = get_connection_properties(connection_id);
+
+    ServiceConnRef dbgServiceConnection = (ServiceConnRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyServiceConnection);
+    AMDServiceConnectionInvalidate(dbgServiceConnection);
+    CFRelease(dbgServiceConnection);
+
+    CFSocketRef lldb_socket = (CFSocketRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyLLDBSocket);
+    CFSocketInvalidate(lldb_socket);
+    CFRelease(lldb_socket);
+
+    CFRunLoopSourceRef lldb_socket_runloop = (CFRunLoopSourceRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyLLDBSocketRunLoop);
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), lldb_socket_runloop, kCFRunLoopCommonModes);
+    CFRelease(lldb_socket_runloop);
+
+    CFSocketRef server_socket = (CFSocketRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyServerSocket);
+    CFSocketInvalidate(server_socket);
+    CFRelease(server_socket);
+
+    CFRunLoopSourceRef server_socket_runloop = (CFRunLoopSourceRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyServerSocketRunLoop);
+    CFRunLoopRemoveSource(CFRunLoopGetMain(), server_socket_runloop, kCFRunLoopCommonModes);
+    CFRelease(server_socket_runloop);
+
+    CFDictionaryRemoveValue(debugserver_active_connections, connection_id);
+}
+
+void server_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info) {
+    CFNumberRef connection_id = (CFNumberRef)info;
+
+    CFMutableDictionaryRef connection_properties = get_connection_properties(connection_id);
+
+    ServiceConnRef dbgServiceConnection = (ServiceConnRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyServiceConnection);
+    CFSocketRef lldb_socket = (CFSocketRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyLLDBSocket);
+
     char buffer[0x1000];
-    int bytesRead = AMDServiceConnectionReceive(dbgServiceConnection, buffer, sizeof(buffer));
-    if (bytesRead == 0)
-    {
-        // close the socket on which we've got end-of-file, the server_socket.
-        CFSocketInvalidate(s);
-        CFRelease(s);
-        return;
-    }
-    write(CFSocketGetNative (lldb_socket), buffer, bytesRead);
-    while (bytesRead == sizeof(buffer))
-    {
+    int bytesRead;
+    do {
         bytesRead = AMDServiceConnectionReceive(dbgServiceConnection, buffer, sizeof(buffer));
-        if (bytesRead > 0)
+        if (bytesRead == 0)
         {
-            write(CFSocketGetNative (lldb_socket), buffer, bytesRead);
+            // close the socket on which we've got end-of-file, the server_socket.
+            close_connection(connection_id);
+            return;
         }
+        write(CFSocketGetNative(lldb_socket), buffer, bytesRead);
     }
+    while (bytesRead == sizeof(buffer));
 }
 
 void lldb_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info)
 {
-    //printf ("lldb: %s\n", CFDataGetBytePtr (data));
+    CFNumberRef connection_id = (CFNumberRef)info;
 
-    if (CFDataGetLength (data) == 0) {
+    CFMutableDictionaryRef connection_properties = get_connection_properties(connection_id);
+
+    ServiceConnRef dbgServiceConnection = (ServiceConnRef)CFDictionaryGetValue(connection_properties, kDbgConnectionPropertyServiceConnection);
+
+    if (CFDataGetLength(data) == 0) {
         // close the socket on which we've got end-of-file, the lldb_socket.
-        CFSocketInvalidate(s);
-        CFRelease(s);
+        close_connection(connection_id);
         return;
     }
     int __unused sent = AMDServiceConnectionSend(dbgServiceConnection, CFDataGetBytePtr(data),  CFDataGetLength (data));
     assert (CFDataGetLength (data) == sent);
 }
 
-void fdvendor_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info) {
-    CFSocketNativeHandle socket = (CFSocketNativeHandle)(*((CFSocketNativeHandle *)data));
-
-    assert (callbackType == kCFSocketAcceptCallBack);
-    //PRINT ("callback!\n");
-
-    lldb_socket  = CFSocketCreateWithNative(NULL, socket, kCFSocketDataCallBack, &lldb_callback, NULL);
-    int flag = 1;
-    int res = setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(flag));
-    if (res == -1) {
-      on_sys_error(@"Setting socket option failed.");
-    }
-    if (lldb_socket_runloop) {
-        CFRelease(lldb_socket_runloop);
-    }
-    lldb_socket_runloop = CFSocketCreateRunLoopSource(NULL, lldb_socket, 0);
-    CFRunLoopAddSource(CFRunLoopGetMain(), lldb_socket_runloop, kCFRunLoopCommonModes);
-
-    CFSocketInvalidate(s);
-    CFRelease(s);
-}
-
-void start_remote_debug_server(AMDeviceRef device) {
-
-    dbgServiceConnection = NULL;
+ServiceConnRef start_remote_debug_server(AMDeviceRef device) {
+    ServiceConnRef dbgServiceConnection = NULL;
     CFStringRef serviceName = CFSTR("com.apple.debugserver");
     CFStringRef keys[] = { CFSTR("MinIPhoneVersion"), CFSTR("MinAppleTVVersion"), CFSTR("MinWatchVersion") };
     CFStringRef values[] = { CFSTR("14.0"), CFSTR("14.0"), CFSTR("7.0") }; // Not sure about older watchOS versions
@@ -1302,16 +1322,69 @@ void start_remote_debug_server(AMDeviceRef device) {
         disable_ssl(dbgServiceConnection);
     }
 
+    return dbgServiceConnection;
+}
+
+void create_remote_debug_server_socket(CFNumberRef connection_id, AMDeviceRef device) {
+    CFMutableDictionaryRef connection_properties = get_connection_properties(connection_id);
+
+    ServiceConnRef dbgServiceConnection = start_remote_debug_server(device);
+    CFDictionaryAddValue(connection_properties, kDbgConnectionPropertyServiceConnection, dbgServiceConnection);
+
     /*
      * The debugserver connection is through a fd handle, while lldb requires a host/port to connect, so create an intermediate
      * socket to transfer data.
      */
-    server_socket = CFSocketCreateWithNative (NULL, AMDServiceConnectionGetSocket(dbgServiceConnection), kCFSocketReadCallBack, &server_callback, NULL);
-    if (server_socket_runloop) {
-        CFRelease(server_socket_runloop);
-    }
-    server_socket_runloop = CFSocketCreateRunLoopSource(NULL, server_socket, 0);
+    CFSocketContext context = get_socket_context(connection_id);
+    CFSocketRef server_socket = CFSocketCreateWithNative (NULL, AMDServiceConnectionGetSocket(dbgServiceConnection), kCFSocketReadCallBack, &server_callback, &context);
+    CFDictionaryAddValue(connection_properties, kDbgConnectionPropertyServerSocket, server_socket);
+
+    CFRunLoopSourceRef server_socket_runloop = CFSocketCreateRunLoopSource(NULL, server_socket, 0);
     CFRunLoopAddSource(CFRunLoopGetMain(), server_socket_runloop, kCFRunLoopCommonModes);
+    CFDictionaryAddValue(connection_properties, kDbgConnectionPropertyServerSocketRunLoop, server_socket_runloop);
+}
+
+void create_local_lldb_socket(CFNumberRef connection_id, CFSocketNativeHandle socket) {
+    CFMutableDictionaryRef connection_properties = get_connection_properties(connection_id);
+
+    CFSocketContext context = get_socket_context(connection_id);
+    CFSocketRef lldb_socket  = CFSocketCreateWithNative(NULL, socket, kCFSocketDataCallBack, &lldb_callback, &context);
+    CFDictionaryAddValue(connection_properties, kDbgConnectionPropertyLLDBSocket, lldb_socket);
+
+    int flag = 1;
+    int res = setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, (char *) &flag, sizeof(flag));
+    if (res == -1) {
+      on_sys_error(@"Setting socket option failed.");
+    }
+    CFRunLoopSourceRef lldb_socket_runloop = CFSocketCreateRunLoopSource(NULL, lldb_socket, 0);
+    CFRunLoopAddSource(CFRunLoopGetMain(), lldb_socket_runloop, kCFRunLoopCommonModes);
+    CFDictionaryAddValue(connection_properties, kDbgConnectionPropertyLLDBSocketRunLoop, lldb_socket_runloop);
+}
+
+void fdvendor_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef address, const void *data, void *info) {
+    static int next_connection_id = 0;
+    CFNumberRef connection_id = CFAutorelease(CFNumberCreate(NULL, kCFNumberIntType, &next_connection_id));
+
+    assert (callbackType == kCFSocketAcceptCallBack);
+
+    if (debugserver_only) {
+        // In case of server mode, we start the debug server connection every time we accept a connection
+        create_remote_debug_server_socket(connection_id, (AMDeviceRef)info);
+        ++next_connection_id;
+    }
+
+    CFSocketNativeHandle socket = (CFSocketNativeHandle)(*((CFSocketNativeHandle *)data));
+    create_local_lldb_socket(connection_id, socket);
+
+    if (!debugserver_only) {
+        // Stop listening after first connection in case not in server mode
+        CFSocketInvalidate(s);
+        CFRelease(s);
+    }
+}
+
+void start_debug_server_multiplexer(AMDeviceRef device) {
+    debugserver_active_connections = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
     struct sockaddr_in addr4;
     memset(&addr4, 0, sizeof(addr4));
@@ -1320,7 +1393,8 @@ void start_remote_debug_server(AMDeviceRef device) {
     addr4.sin_port = htons(port);
     addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    CFSocketRef fdvendor = CFSocketCreate(NULL, PF_INET, 0, 0, kCFSocketAcceptCallBack, &fdvendor_callback, NULL);
+    CFSocketContext context = { 0, device, NULL, NULL, NULL };
+    CFSocketRef fdvendor = CFSocketCreate(NULL, PF_INET, 0, 0, kCFSocketAcceptCallBack, &fdvendor_callback, &context);
 
     if (port) {
         int yes = 1;
@@ -1432,14 +1506,23 @@ void setup_lldb(AMDeviceRef device, CFURLRef url) {
     NSLogOut(@"Starting debug of %@ connected through %@...", device_full_name, device_interface_name);
 
     mount_developer_image(device);      // put debugserver on the device
-    start_remote_debug_server(device);  // start debugserver
-    if (!debugserver_only)
+
+    start_debug_server_multiplexer(device);  // start debugserver proxy listener
+    if (debugserver_only) {
+        NSLogOut(@"[100%%] Listening for lldb connections");
+    }
+    else {
+        int connection_id = 0;
+        CFNumberRef cf_connection_id = CFAutorelease(CFNumberCreate(NULL, kCFNumberIntType, &connection_id));
+
+        create_remote_debug_server_socket(cf_connection_id, device);   // start debugserver
         write_lldb_prep_cmds(device, url);   // dump the necessary lldb commands into a file
+        NSLogOut(@"[100%%] Connecting to remote debug server");
+    }
+    NSLogOut(@"-------------------------");
+
     if (url != NULL)
         CFRelease(url);
-
-    NSLogOut(@"[100%%] Connecting to remote debug server");
-    NSLogOut(@"-------------------------");
 
     setpgid(getpid(), 0);
     signal(SIGHUP, killed);
@@ -2049,6 +2132,19 @@ void list_bundle_id(AMDeviceRef device)
     CFDictionaryRef result = nil;
     check_error(AMDeviceLookupApplications(device, options, &result));
 
+    if (bundle_id != NULL) {
+        CFStringRef cf_bundle_id = CFAutorelease(CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8));
+        CFDictionaryRef app_dict = CFRetain(CFDictionaryGetValue(result, cf_bundle_id));
+
+        CFRelease(result);
+        result = CFAutorelease(CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
+
+        if (app_dict != NULL) {
+            CFDictionaryAddValue((CFMutableDictionaryRef)result, cf_bundle_id, app_dict);
+            CFRelease(app_dict);
+        }
+    }
+
     if (_json_output) {
         NSLogJSON(@{@"Event": @"ListBundleId",
                     @"Apps": (NSDictionary *)result});
@@ -2352,19 +2448,21 @@ void check_developer_mode(AMDeviceRef device) {
 }
 #endif
 
+ServiceConnRef symbolsServiceConnection = NULL;
+
 void start_symbols_service_with_command(AMDeviceRef device, uint32_t command) {
     connect_and_start_session(device);
     check_error(AMDeviceSecureStartService(device, symbols_service_name,
-                                           NULL, &dbgServiceConnection));
+                                           NULL, &symbolsServiceConnection));
 
-    uint32_t bytes_sent = AMDServiceConnectionSend(dbgServiceConnection, &command,
+    uint32_t bytes_sent = AMDServiceConnectionSend(symbolsServiceConnection, &command,
                                                     sizeof_uint32_t);
     if (bytes_sent != sizeof_uint32_t) {
         on_error(@"Sent %d bytes but was expecting %d.", bytes_sent, sizeof_uint32_t);
     }
 
     uint32_t response;
-    uint32_t bytes_read = AMDServiceConnectionReceive(dbgServiceConnection,
+    uint32_t bytes_read = AMDServiceConnectionReceive(symbolsServiceConnection,
                                                         &response, sizeof_uint32_t);
     if (bytes_read != sizeof_uint32_t) {
         on_error(@"Read %d bytes but was expecting %d.", bytes_read, sizeof_uint32_t);
@@ -2379,7 +2477,7 @@ CFArrayRef get_dyld_file_paths(AMDeviceRef device) {
     CFPropertyListFormat format;
     CFDictionaryRef dict = NULL;
     uint64_t bytes_read =
-        AMDServiceConnectionReceiveMessage(dbgServiceConnection, &dict, &format);
+        AMDServiceConnectionReceiveMessage(symbolsServiceConnection, &dict, &format);
     if (bytes_read == -1) {
         on_error(@"Received %d bytes after succesfully starting command %d.", bytes_read,
                  symbols_file_paths_command);
@@ -2424,7 +2522,7 @@ void write_dyld_file(CFStringRef dest, uint64_t file_size) {
         // INT_MAX bytes at a time.
         uint64_t bytes_to_download = MIN(bytes_remaining, INT_MAX - 1);
         uint64_t bytes_read = AMDServiceConnectionReceive(
-            dbgServiceConnection, map + total_bytes_read, bytes_to_download);
+            symbolsServiceConnection, map + total_bytes_read, bytes_to_download);
         total_bytes_read += bytes_read;
 
         uint64_t current_time =
@@ -2455,13 +2553,13 @@ CFStringRef download_dyld_file(AMDeviceRef device, uint32_t dyld_index,
 
     uint32_t index = CFSwapInt32HostToBig(dyld_index);
     uint64_t bytes_sent =
-        AMDServiceConnectionSend(dbgServiceConnection, &index, sizeof_uint32_t);
+        AMDServiceConnectionSend(symbolsServiceConnection, &index, sizeof_uint32_t);
     if (bytes_sent != sizeof_uint32_t) {
         on_error(@"Sent %d bytes but was expecting %d.", bytes_sent, sizeof_uint32_t);
     }
 
     uint64_t file_size = 0;
-    uint64_t bytes_read = AMDServiceConnectionReceive(dbgServiceConnection,
+    uint64_t bytes_read = AMDServiceConnectionReceive(symbolsServiceConnection,
                                                     &file_size, sizeof(uint64_t));
     if (bytes_read != sizeof(uint64_t)) {
         on_error(@"Read %d bytes but was expecting %d.", bytes_read, sizeof(uint64_t));
@@ -2580,7 +2678,7 @@ void dyld_shared_cache_extract_dylibs(CFStringRef dsc_extractor_bundle_path,
 }
 
 void download_device_symbols(AMDeviceRef device) {
-    dbgServiceConnection = NULL;
+    symbolsServiceConnection = NULL;
     CFArrayRef files = get_dyld_file_paths(device);
     CFIndex files_count = CFArrayGetCount(files);
     NSLogOut(@"Downloading symbols files: %@", files);
@@ -2606,6 +2704,476 @@ void download_device_symbols(AMDeviceRef device) {
 
     CFRelease(downloaded_files);
     CFRelease(dsc_extractor_bundle);
+}
+
+typedef struct {
+  uint32_t magic;
+  uint32_t cb;
+  uint16_t fragmentId;
+  uint16_t fragmentCount;
+  uint32_t length;
+  uint32_t identifier;
+  uint32_t conversationIndex;
+  uint32_t channelCode;
+  uint32_t expectsReply;
+} DTXMessageHeader;
+
+typedef struct {
+  uint32_t flags;
+  uint32_t auxiliaryLength;
+  uint64_t totalLength;
+} DTXMessagePayloadHeader;
+
+uint32_t instruments_current_message_id = 0;
+
+ServiceConnRef instrumentsServiceConnection = NULL;
+NSDictionary<NSString*, NSNumber*>* instruments_available_channels = nil;
+
+static const uint32 DTXMessageHeaderMagic = 0x1F3D5B79;
+static const uint64 DTXAuxillaryDataMagic = 0x1F0;
+
+static const uint32 EmptyDictionaryKey = 10;
+static const uint32 ObjectArgumentType = 2;
+static const uint32 Int32ArgumentType = 3;
+static const uint32 Int64ArgumentType = 4;
+
+NSData* instruments_object_argument(void * argument) {
+    NSError *error = nil;
+    NSData *argumentData = [NSKeyedArchiver archivedDataWithRootObject:argument];
+    if (error) {
+        on_error(@"Error communicating with the intruments server: %@", error);
+    }
+    uint32 argumentSize = (uint32) argumentData.length;
+    NSMutableData *data = NSMutableData.data;
+    [data appendBytes:&EmptyDictionaryKey length:sizeof(EmptyDictionaryKey)];
+    [data appendBytes:&ObjectArgumentType length:sizeof(ObjectArgumentType)];
+    [data appendBytes:&argumentSize length:sizeof(argumentSize)];
+    [data appendData:argumentData];
+    return data;
+}
+
+NSData* instruments_int32_argument(int32_t value) {
+    NSMutableData *data = NSMutableData.data;
+    [data appendBytes:&EmptyDictionaryKey length:sizeof(EmptyDictionaryKey)];
+    [data appendBytes:&Int32ArgumentType length:sizeof(Int32ArgumentType)];
+    [data appendBytes:&value length:sizeof(value)];
+    return data;
+}
+
+NSData* instruments_int64_argument(int64_t value) {
+    NSMutableData *data = NSMutableData.data;
+    [data appendBytes:&EmptyDictionaryKey length:sizeof(EmptyDictionaryKey)];
+    [data appendBytes:&Int64ArgumentType length:sizeof(Int64ArgumentType)];
+    [data appendBytes:&value length:sizeof(value)];
+    return data;
+}
+
+void instruments_send_message(int channel, NSString* selector, const NSArray<NSData*> *args, bool expects_reply) {
+    uint32_t id = ++instruments_current_message_id;
+
+    // Serialize arguments
+    NSMutableData *auxillaryData = NSMutableData.data;
+    if (args != nil) {
+        NSMutableData *argumentsData = NSMutableData.data;
+        for (NSData *argument in args) {
+            [argumentsData appendData:argument];
+        }
+
+        uint64 payloadLength = argumentsData.length;
+        [auxillaryData appendBytes:&DTXAuxillaryDataMagic length:sizeof(DTXAuxillaryDataMagic)];
+        [auxillaryData appendBytes:&payloadLength length:sizeof(payloadLength)];
+        [auxillaryData appendData:argumentsData];
+    }
+
+    // Serialize selector
+    NSError *error = nil;
+    NSData *selectorData = [NSKeyedArchiver archivedDataWithRootObject:selector];
+    if (error) {
+        on_error(@"Error communicating with the intruments server: %@", error);
+    }
+
+    // Prepare the message
+    DTXMessagePayloadHeader payloadHeader;
+    payloadHeader.flags = 0x2 | (expects_reply ? 0x1000 : 0);
+    payloadHeader.auxiliaryLength = (uint32) auxillaryData.length;
+    payloadHeader.totalLength = auxillaryData.length + selectorData.length;
+
+    DTXMessageHeader messageHeader;
+    messageHeader.magic = DTXMessageHeaderMagic;
+    messageHeader.cb = sizeof(DTXMessageHeader);
+    messageHeader.fragmentId = 0;
+    messageHeader.fragmentCount = 1;
+    messageHeader.length = (uint32_t)(sizeof(payloadHeader) + payloadHeader.totalLength);
+    messageHeader.identifier = id;
+    messageHeader.conversationIndex = 0;
+    messageHeader.channelCode = channel;
+    messageHeader.expectsReply = (expects_reply ? 1 : 0);
+
+    NSMutableData *data = NSMutableData.data;
+    [data appendBytes:&messageHeader length:sizeof(messageHeader)];
+    [data appendBytes:&payloadHeader length:sizeof(payloadHeader)];
+    [data appendData:auxillaryData];
+    [data appendData:selectorData];
+
+    // Send message
+    uint64_t bytes_sent = AMDServiceConnectionSend(instrumentsServiceConnection, data.bytes, data.length);
+    if (bytes_sent != data.length) {
+        on_error(@"Error communicating with instruments server");
+    }
+}
+
+NSArray<id>* instruments_parse_auxillary_data(NSData* data) {
+    if (data == nil) {
+        return nil;
+    }
+
+    if (data.length < 16) {
+        on_error(@"Insufficient data to parse");
+    }
+
+    uint64_t offset = sizeof(uint64_t);
+
+    uint64_t payloadLength;
+    [data getBytes:&payloadLength range:NSMakeRange(offset, sizeof(payloadLength))];
+    offset += sizeof(payloadLength);
+
+    uint64_t end = offset + payloadLength;
+
+    NSMutableArray<id> *arguments = NSMutableArray.array;
+
+    while (offset < end) {
+        uint32 type = 0;
+        [data getBytes:&type range:NSMakeRange(offset, sizeof(type))];
+        offset += sizeof(type);
+
+        uint32 length = 0;
+
+        id value = nil;
+
+        switch (type) {
+            case 2:
+                [data getBytes:&length range:NSMakeRange(offset, sizeof(length))];
+                offset += sizeof(length);
+                value = [NSKeyedUnarchiver unarchiveObjectWithData:[data subdataWithRange:NSMakeRange(offset, length)]];
+                break;
+            case 3:
+            case 5:
+            {
+                int32_t intValue;
+                [data getBytes:&intValue range:NSMakeRange(offset, sizeof(intValue))];
+                offset += sizeof(intValue);
+                value = [NSNumber numberWithInt:intValue];
+                break;
+            }
+            case 4:
+            case 6:
+            {
+                int64_t intValue;
+                [data getBytes:&intValue range:NSMakeRange(offset, sizeof(intValue))];
+                offset += sizeof(intValue);
+                value = [NSNumber numberWithLongLong:intValue];
+                break;
+            }
+            case 10:
+                // Empty dictionary value, ignore
+                continue;
+            default:
+                // Unknown
+                break;
+        }
+
+        if (value == nil) {
+            on_error(@"Error communicating with instruments server: Error parsing auxiliary data");
+        }
+        [arguments addObject:value];
+        offset += length;
+    }
+
+    return [arguments retain];
+}
+
+void instruments_receive_message(id* returnValue, NSArray<id>** auxillaryValues) {
+    NSMutableData *payloadData = NSMutableData.data;
+
+    DTXMessageHeader messageHeader;
+    do {
+        uint32_t bytes_read = AMDServiceConnectionReceive(instrumentsServiceConnection, &messageHeader, sizeof(messageHeader));
+        if (bytes_read != sizeof(messageHeader)) {
+            on_error(@"Error communicating with instruments server: Error in reading response");
+        }
+        if (messageHeader.magic != DTXMessageHeaderMagic) {
+            on_error(@"Error communicating with instruments server: Magic in response magic does not match");
+        }
+        if (messageHeader.conversationIndex == 0 && messageHeader.identifier < instruments_current_message_id) {
+            // New message with unexpected identifier
+            on_error(@"Error communicating with instruments server: response identifier %d is lower than the last request (%d)", messageHeader.identifier, instruments_current_message_id);
+        }
+        if (messageHeader.conversationIndex == 1 && messageHeader.identifier != instruments_current_message_id) {
+            // This is a response, but the message id does not match
+            on_error(@"Error communicating with instruments server: expected response to message id %d, got %d", instruments_current_message_id, messageHeader.identifier);
+        }
+
+        instruments_current_message_id = messageHeader.identifier;
+
+        if (messageHeader.fragmentId == 0 && messageHeader.fragmentCount > 1) {
+            // First message in multi-fragment message has only payload.
+            continue;
+        }
+
+        void *buffer = alloca(messageHeader.length);
+        void *buffer_current = buffer;
+        uint32_t remaining_bytes = messageHeader.length;
+        while (remaining_bytes > 0) {
+            uint32_t bytes_read = AMDServiceConnectionReceive(instrumentsServiceConnection, buffer_current, remaining_bytes);
+            if (bytes_read <= 0) {
+                on_error(@"Error communicating with instruments server: Error in reading response");
+            }
+
+            buffer_current += bytes_read;
+            remaining_bytes -= bytes_read;
+        }
+
+        [payloadData appendBytes:buffer length:messageHeader.length];
+    } while (messageHeader.fragmentId < messageHeader.fragmentCount - 1);
+
+    const DTXMessagePayloadHeader *payloadHeader = (const DTXMessagePayloadHeader *)payloadData.bytes;
+
+    if ((payloadHeader->flags & 0xFF000) >> 12) {
+        on_error(@"Error communicating with instruments server: Compression is not supported");
+    }
+
+    // serialized object array is located just after payload header
+    NSData* auxillaryData = nil;
+    if (payloadHeader->auxiliaryLength) {
+        auxillaryData = [payloadData subdataWithRange:NSMakeRange(sizeof(DTXMessagePayloadHeader), payloadHeader->auxiliaryLength)];
+    }
+    if (auxillaryValues != nil) {
+        *auxillaryValues = instruments_parse_auxillary_data(auxillaryData);
+    }
+
+    // archived payload object appears after the auxiliary array
+    size_t returnValueDataLength = payloadHeader->totalLength - payloadHeader->auxiliaryLength;
+    NSData* returnValueData = nil;
+    if (returnValueDataLength) {
+        returnValueData = [payloadData subdataWithRange:NSMakeRange(sizeof(DTXMessagePayloadHeader) + payloadHeader->auxiliaryLength, returnValueDataLength)];
+    }
+    if (returnValue != nil) {
+        *returnValue = [NSKeyedUnarchiver unarchiveObjectWithData:returnValueData];
+    }
+}
+
+void instruments_perform_handshake() {
+    NSDictionary* capabilities = @{
+        @"com.apple.private.DTXBlockCompression": @2,
+        @"com.apple.private.DTXConnection": @1
+    };
+
+    instruments_send_message(
+        0 /* channel */,
+        @"_notifyOfPublishedCapabilities:",
+        @[
+            instruments_object_argument(capabilities)
+        ] /* args */,
+        false /* expectes_reply */
+    );
+
+    id returnValue = nil;
+    NSArray<id>* auxillaryValues = nil;
+    instruments_receive_message(&returnValue, &auxillaryValues);
+
+    if (![returnValue isKindOfClass:NSString.class] || ![returnValue isEqualToString:@"_notifyOfPublishedCapabilities:"]) {
+        on_error(@"Error communicating with instruments server: unexpected response selector");
+    }
+
+    NSDictionary<NSString*, NSNumber*>* channels = auxillaryValues.firstObject;
+    if (![channels isKindOfClass:NSDictionary.class]) {
+        on_error(@"Error communicating with instruments server: unexpected channel list type");
+    }
+
+    instruments_available_channels = [channels retain];
+
+    [returnValue release];
+    [auxillaryValues release];
+}
+
+id instruments_perform_selector(int channel, NSString* selector, const NSArray<NSData*> *args) {
+    instruments_send_message(channel, selector, args, true /* expectes_reply */);
+
+    id returnValue = nil;
+    instruments_receive_message(&returnValue, nil);
+
+    return returnValue;
+}
+
+int32_t instruments_make_channel(NSString* identifier) {
+    if (![instruments_available_channels objectForKey:identifier]) {
+        on_error(@"Channel %@ not supported by the server", identifier);
+    }
+
+    static int32_t channel_id = 0;
+    int32_t code = ++channel_id;
+
+    id returnValue = instruments_perform_selector(
+        0 /* channel */,
+        @"_requestChannelWithCode:identifier:",
+        @[
+            instruments_int32_argument(code),
+            instruments_object_argument(identifier)
+        ]
+    );
+
+    if (returnValue != nil) {
+        on_error(@"Error: _requestChannelWithCode:identifier: returned %@", returnValue);
+    }
+
+    [returnValue release];
+
+    return code;
+}
+
+void instruments_connect_service(AMDeviceRef device) {
+    connect_and_start_session(device);
+    mount_developer_image(device);
+
+    // Check version similar to start_remote_debug_server
+    CFStringRef keys[] = { CFSTR("MinIPhoneVersion"), CFSTR("MinAppleTVVersion"), CFSTR("MinWatchVersion") };
+    CFStringRef values[] = { CFSTR("14.0"), CFSTR("14.0"), CFSTR("7.0") }; // Not sure about older watchOS versions
+    CFDictionaryRef version = CFDictionaryCreate(NULL, (const void **)&keys, (const void **)&values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+    bool useSecureProxy = AMDeviceIsAtLeastVersionOnPlatform(device, version);
+
+    // Start the instruments server
+    assert(instrumentsServiceConnection == NULL);
+    CFStringRef serviceName = useSecureProxy ? CFSTR("com.apple.instruments.remoteserver.DVTSecureSocketProxy") : CFSTR("com.apple.instruments.remoteserver");
+    check_error(AMDeviceSecureStartService(device, serviceName, NULL, &instrumentsServiceConnection));
+
+    assert(instrumentsServiceConnection != NULL);
+
+    if (!useSecureProxy)
+    {
+        disable_ssl(instrumentsServiceConnection);
+    }
+
+    check_error(AMDeviceStopSession(device));
+    check_error(AMDeviceDisconnect(device));
+}
+
+NSNumber* pid_for_bundle_id(NSString* bundle_id) {
+    int32_t channel = instruments_make_channel(@"com.apple.instruments.server.services.processcontrol");
+
+    id pid = instruments_perform_selector(channel, @"processIdentifierForBundleIdentifier:", @[instruments_object_argument(bundle_id)]);
+
+    if (pid != nil && ![pid isKindOfClass:NSNumber.class]) {
+        on_error(@"Error: did not get valid response from processIdentifierForBundleIdentifier:");
+    }
+
+    // Return -1 if pid is not found
+    return (pid == nil || [pid isEqualToNumber:@0]) ? @-1 : pid;
+}
+
+void get_pid(AMDeviceRef device) {
+    if (bundle_id == NULL) {
+        on_error(@"Error: bundle id required, please specify with --bundle_id.");
+    }
+
+    instruments_connect_service(device);
+    instruments_perform_handshake();
+
+    CFStringRef cf_bundle_id = CFAutorelease(CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8));
+
+    NSNumber* pid = pid_for_bundle_id((NSString*)cf_bundle_id);
+
+    NSLogOut(@"pid: %@", pid);
+    NSLogJSON(@{@"Event": @"GetPid",
+                @"pid": pid});
+}
+
+void kill_app(AMDeviceRef device) {
+    if (bundle_id == NULL && command_pid <= 0) {
+        on_error(@"Error: must specify either --pid or --bundle_id");
+    }
+
+    instruments_connect_service(device);
+    instruments_perform_handshake();
+
+    NSNumber* ns_pid = [NSNumber numberWithInt:command_pid];
+    if (![ns_pid isGreaterThan:@0]) {
+        CFStringRef cf_bundle_id = CFAutorelease(CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8));
+        ns_pid = pid_for_bundle_id((NSString*)cf_bundle_id);
+
+        if (![ns_pid isGreaterThan:@0]) {
+            NSLogOut(@"Could not find pid for bundle '%@'. Nothing to kill.", cf_bundle_id);
+            return;
+        }
+    }
+
+    int32_t channel = instruments_make_channel(@"com.apple.instruments.server.services.processcontrol");
+
+    instruments_send_message(channel, @"killPid:", @[instruments_object_argument(ns_pid)], false /* expectes_reply */);
+    [ns_pid release];
+}
+
+void list_processes(AMDeviceRef device) {
+    instruments_connect_service(device);
+    instruments_perform_handshake();
+
+    int32_t channel = instruments_make_channel(@"com.apple.instruments.server.services.deviceinfo");
+
+    id processes = instruments_perform_selector(channel, @"runningProcesses", nil /* args */);
+
+    if (processes == nil || ![processes isKindOfClass:NSArray.class]) {
+        on_error(@"Error: could not retrieve return value for runningProcesses");
+    }
+
+    if (bundle_id != NULL) {
+        CFStringRef cf_bundle_id = CFAutorelease(CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8));
+        NSNumber* pid = pid_for_bundle_id((NSString*)cf_bundle_id);
+
+        NSMutableArray* filteredProcesses = NSMutableArray.array;
+
+        if ([pid isGreaterThan:@0]) {
+            for (NSDictionary* proc in processes) {
+                NSNumber* procPid = proc[@"pid"];
+                if (procPid == pid) {
+                    [filteredProcesses addObject:proc];
+                }
+            }
+        }
+
+        [processes release];
+        processes = filteredProcesses;
+    }
+
+    if (_json_output) {
+        // NSDate cannot be serialized to JSON as is, manually convert it it NSString
+        NSDateFormatter *dateFormatter = [[NSDateFormatter alloc] init];
+        [dateFormatter setDateFormat:@"yyyy'-'MM'-'dd'T'HH':'mm':'ss.SSS'Z'"];
+        [dateFormatter setTimeZone:[NSTimeZone timeZoneWithName:@"GMT"]];
+
+        NSMutableArray* processesCopy = NSMutableArray.array;
+        for (NSDictionary* proc in processes) {
+            NSMutableDictionary* procCopy = [NSMutableDictionary dictionaryWithDictionary:proc];
+
+            if (procCopy[@"startDate"] != nil) {
+                NSString *startDate = [dateFormatter stringFromDate:procCopy[@"startDate"]];
+                [procCopy removeObjectForKey:@"startDate"];
+                [procCopy setObject:startDate forKey:@"startDate"];
+            }
+
+            [processesCopy addObject:procCopy];
+        }
+
+        NSLogJSON(@{@"Event": @"ListProcesses",
+                    @"Processes": processesCopy});
+    }
+    else {
+        NSLogOut(@"PID\tNAME");
+        for (NSDictionary* proc in processes) {
+            NSLogOut(@"%@\t%@", proc[@"pid"], proc[@"name"]);
+        }
+    }
+
+    [processes release];
 }
 
 void handle_device(AMDeviceRef device) {
@@ -2667,6 +3235,10 @@ void handle_device(AMDeviceRef device) {
             uninstall_app(device);
         } else if (strcmp("list_bundle_id", command) == 0) {
             list_bundle_id(device);
+        } else if (strcmp("list_processes", command) == 0) {
+            list_processes(device);
+        } else if (strcmp("get_pid", command) == 0) {
+            get_pid(device);
         } else if (strcmp("get_battery_level", command) == 0) {
             get_battery_level(device);
         } else if (strcmp("symbols", command) == 0) {
@@ -2681,9 +3253,11 @@ void handle_device(AMDeviceRef device) {
             download_provisioning_profile(device);
 #if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
         } else if (strcmp("check_developer_mode", command) == 0) {
-          check_developer_mode(device);
+            check_developer_mode(device);
 #endif
-      }
+        } else if (strcmp("kill_app", command) == 0) {
+            kill_app(device);
+        }
         exit(0);
     }
 
@@ -2832,6 +3406,43 @@ void handle_device(AMDeviceRef device) {
     }
 }
 
+void log_device_disconnected(AMDeviceRef device) {
+    CFStringRef device_interface_name = get_device_interface_name(device);
+    CFStringRef device_uuid = CFAutorelease(AMDeviceCopyDeviceIdentifier(device));
+
+    if (_json_output) {
+        NSLogJSON(@{@"Event": @"DeviceDisconnected",
+                    @"Interface": (__bridge NSString *)device_interface_name,
+                    @"Device": get_device_json_dict(device)
+                    });
+    }
+    else {
+        NSLogOut(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
+    }
+}
+
+void handle_device_disconnected(AMDeviceRef device) {
+    CFStringRef device_interface_name = get_device_interface_name(device);
+    CFStringRef device_uuid = AMDeviceCopyDeviceIdentifier(device);
+
+    if (detect_only) {
+        log_device_disconnected(device);
+    }
+    else {
+        NSLogVerbose(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
+    }
+
+    if (debugserver_only) {
+        CFStringRef deviceCFSTR = CFAutorelease(CFStringCreateWithCString(NULL, device_id, kCFStringEncodingUTF8));
+        if (CFStringCompare(deviceCFSTR, device_uuid, kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
+            log_device_disconnected(device);
+            exit(0);
+        }
+    }
+
+    CFRelease(device_uuid);
+}
+
 void device_callback(struct am_device_notification_callback_info *info, void *arg) {
     switch (info->msg) {
         case ADNCI_MSG_CONNECTED:
@@ -2850,16 +3461,7 @@ void device_callback(struct am_device_notification_callback_info *info, void *ar
         }
         case ADNCI_MSG_DISCONNECTED:
         {
-            CFStringRef device_interface_name = get_device_interface_name(info->dev);
-            CFStringRef device_uuid = AMDeviceCopyDeviceIdentifier(info->dev);
-            NSLogVerbose(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
-            if (detect_only && _json_output) {
-                NSLogJSON(@{@"Event": @"DeviceDisconnected",
-                            @"Interface": (__bridge NSString *)device_interface_name,
-                            @"Device": get_device_json_dict(info->dev)
-                            });
-            }
-            CFRelease(device_uuid);
+            handle_device_disconnected(info->dev);
             break;
         }
         default:
@@ -2934,6 +3536,10 @@ void usage(const char* app) {
         @"  -V, --version                print the executable version \n"
         @"  -e, --exists                 check if the app with given bundle_id is installed or not \n"
         @"  -B, --list_bundle_id         list bundle_id \n"
+        @"  --list_processes             list running processes \n"
+        @"  --get_pid                    get process id for the bundle. must specify --bundle_id\n"
+        @"  --pid <pid>                  specify pid, to be used with --kill\n"
+        @"  --kill                       kill a process. must specify either --pid or --bundle_id\n"
         @"  -W, --no-wifi                ignore wifi devices\n"
         @"  -C, --get_battery_level      get battery current capacity \n"
         @"  -O, --output <file>          write stdout to this file\n"
@@ -2953,10 +3559,9 @@ void usage(const char* app) {
         @"  --profile-install <file>     install a provisioning profile\n"
         @"  --profile-uninstall          uninstall a provisioning profile (requires --profile-uuid <UUID>)\n"
 #if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
-        @"  --check-developer-mode       checks whether the given device has developer mode enabled (requires Xcode 14 or newer)\n",
-#else
-        ,
+        @"  --check-developer-mode       checks whether the given device has developer mode enabled (requires Xcode 14 or newer)\n"
 #endif
+        ,
         [NSString stringWithUTF8String:app]);
 }
 
@@ -3025,6 +3630,10 @@ int main(int argc, char *argv[]) {
 #if defined(IOS_DEPLOY_FEATURE_DEVELOPER_MODE)
         { "check-developer-mode", no_argument, NULL, 1008},
 #endif
+        { "list_processes", no_argument, NULL, 1009},
+        { "get_pid", no_argument, NULL, 1010},
+        { "pid", required_argument, NULL, 1011},
+        { "kill", no_argument, NULL, 1012},
         { NULL, 0, NULL, 0 },
     };
     int ch;
@@ -3142,6 +3751,14 @@ int main(int argc, char *argv[]) {
             command_only = true;
             command = "list_bundle_id";
             break;
+        case 1009:
+            command_only = true;
+            command = "list_processes";
+            break;
+        case 1010:
+            command_only = true;
+            command = "get_pid";
+            break;
         case 'W':
             no_wifi = true;
             break;
@@ -3213,6 +3830,13 @@ int main(int argc, char *argv[]) {
         case 'k':
             if (!keys) keys = [[NSMutableArray alloc] init];
             [keys addObject: [NSString stringWithUTF8String:optarg]];
+            break;
+        case 1011:
+            command_pid = atoi(optarg);
+            break;
+        case 1012:
+            command_only = true;
+            command = "kill_app";
             break;
         default:
             usage(argv[0]);
